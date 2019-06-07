@@ -1,16 +1,16 @@
+from datetime import datetime
 import aiodocker
 import aioftp
 import os
-import subprocess
 from aiohttp import web
-from gcloud import storage, resource_manager
+from gcloud import storage
 from pathlib import Path
 import asyncio
 import aiojobs
 from aiojobs.aiohttp import setup, spawn
 from multidict import MultiDict
-from select import select
 import logging
+from aiofile import AIOFile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -18,12 +18,15 @@ host = "localhost"
 ftp_user = "bob"
 ftp_password = "12345"
 folder = Path().absolute()
-status = 'IDLE'
+state = {
+    'status': 'IDLE',
+    'error': None
+    }
 
 routes = web.RouteTableDef()
 
 
-# con = ftplib.FTP(host=host, user=ftp_user, passwd=ftp_password)
+pwd = os.path.dirname(os.path.abspath(__file__))
 
 
 # Loading block
@@ -40,33 +43,62 @@ routes = web.RouteTableDef()
 
 # Downloading block
 async def download_csv():
-    global status
-    status = "Files downloading"
-    async with aioftp.ClientSession(host=host, user=ftp_user, password=ftp_password) as client:
-        for path, info in (await client.list()):
-            await client.download(path, destination="./Work/pipeline/" + path.name, write_into=True)
+    global state
+    error = None
+    state['status'] = "Files downloading"
+    try:
+        async with aioftp.ClientSession(host=host, user=ftp_user, password=ftp_password) as client:
+            for path, info in (await client.list()):
+                try:
+                    await client.download(path, destination=f"{pwd}/r-driveproject/src/data/" + path.name,
+                                          write_into=True)
+                except Exception as e:
+                    state['status'] = 'FAILED'
+                    state['error'] = e
+                    error = 'CSV download failed'
+
+    except Exception as exc:
+        state['status'] = 'FAILED'
+        state['error'] = exc
+        error = 'Something went wrong with connection to FTP'
+
+    return error
 
 
 async def model_training():
-    global status
-    status = "Model training."
-    await asyncio.create_subprocess_shell('Rscript /home/vyachap/Work/pipeline/estimate_models.R '
-                                          '--booked /home/vyachap/Work/pipeline/md.csv '
-                                          '--cogs /home/vyachap/Work/pipeline/mdcogs.csv')
+    global state
+    state['status'] = "Model training"
+    error = None
+    r_script = await asyncio.create_subprocess_shell(f'Rscript {pwd}/estimate_models.R '
+                                                     f'--booked {pwd}/md.csv '
+                                                     f'--cogs {pwd}/mdcogs.csv '
+                                                     f'--output {pwd}/r-driveproject/src/data/',
+                                                     stdout=asyncio.subprocess.PIPE,
+                                                     stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await r_script.communicate()
+
+    if r_script.returncode != 0:
+        state['status'] = 'FAILED'
+        state['error'] = stderr.decode()
+        error = stderr.decode()
+
+    return error
 
 
 async def build_image():
-    global status
-    status = "Image building."
-    docker = aiodocker.Docker()
-    # Add a real path to Dockerfile in r-project-service.
-    await docker.images.build(path_dockerfile='./r-driveproject/Dockerfile', tag='lol:kek', rm=True)
+    global state
+    state['status'] = "Image building"
+    error = None
+    tag = datetime.now().strftime("%Y%m%d%H%M")
+    image = await asyncio.create_subprocess_shell(f'docker build -t us.gcr.io/synapse-157713/r-demo-project:{tag} {pwd}/r-driveproject')
+    stdout, stderr = await image.communicate()
 
+    if image.returncode != 0:
+        state['status'] = 'FAILED'
+        state['error'] = stderr.decode()
+        error = stderr.decode()
 
-@routes.get('/status')
-async def status_endpoint(request):
-    global status
-    return web.Response(text=status)
+    return error
 
 
 async def upload_csv(request):
@@ -87,6 +119,38 @@ async def upload_image():
     pass
 
 
+async def start():
+    global state
+    state['error'] = None
+    pipeline = [
+        # download_csv,
+        # model_training,
+        build_image,
+    ]
+    for func in pipeline:
+        if await func() is not None:
+            return
+
+    state['status'] = 'IDLE'
+    # upload_csv()
+    # upload_model()
+    # upload_image()
+
+
+async def file_upload_handler(request):
+    data = await request.post()
+    script = data['script']
+    filename = script.filename
+    script_file = data['script'].file
+    content = script_file.read()
+    return web.Response(body=content, headers=MultiDict({'CONTENT-DISPOSITION': script_file}))
+
+
+@routes.get('/')
+async def handler(request):
+    return web.Response(text='OK')
+
+
 @routes.post('/training')
 async def training_endpoint(request):
     try:
@@ -103,40 +167,13 @@ async def start_pipeline(request):
     return web.Response(text="Pipeline started")
 
 
-async def start():
-    global status
-    try:
-        await download_csv()
-    except Exception as e:
-        status = 'FAILED'
-        return web.Response(text="Download failed. Reason: {}".format(e), status=500)
-    try:
-        await model_training()
-    except Exception as e:
-        status = 'FAILED'
-        return web.Response(text="R-model training failed. Reason: {}".format(e), status=500)
-    # upload_csv()
-    # upload_model()
-    try:
-        await build_image()
-    except Exception as e:
-        status = 'FAILED'
-        return web.Response(text="Image building failed. Reason: {}".format(e), status=500)
-    # upload_image()
-
-
-async def file_upload_handler(request):
-    data = await request.post()
-    script = data['script']
-    filename = script.filename
-    script_file = data['script'].file
-    content = script_file.read()
-    return web.Response(body=content, headers=MultiDict({'CONTENT-DISPOSITION': script_file}))
-
-
-@routes.get('/')
-async def handler(request):
-    return web.Response(text='OK')
+@routes.get('/status')
+async def status_endpoint(request):
+    global state
+    if state['error']:
+        return web.Response(text=" Status: {}.\n Error: {}".format(state['status'], state['error']))
+    else:
+        return web.Response(text=" Status: {}.".format(state['status']))
 
 
 app = web.Application()

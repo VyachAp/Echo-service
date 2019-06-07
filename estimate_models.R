@@ -8,11 +8,16 @@ option_list = list(
   make_option(c("--booked"), type="character", default=NULL, 
               help="Dataset for model probability of booking a truck (filepath)", metavar="character"),
   make_option(c("--cogs"), type="character", default=NULL, 
-              help="Dataset for model buy cost given successful booking (filepath)", metavar="character")
+              help="Dataset for model buy cost given successful booking (filepath)", metavar="character"),
+  make_option(c("--output"), type="character", default='./', 
+              help="Path to directory for saving models (filepath)", metavar="character")
 ); 
 
 opt_parser = OptionParser(option_list=option_list);
 opt = parse_args(opt_parser);
+if (substr(opt$output, nchar(opt$output), nchar(opt$output)) != '/') {
+  opt$output = paste(opt$output, '/', sep='')
+}
 
 if (is.null(opt$booked)){
   print_help(opt_parser)
@@ -33,7 +38,7 @@ mod_booked <- glmer(Booked ~ (1|AssignmentType) + (1|RepOriginMarketId) + (1|Rep
                     , nAGQ = 0
                     , control=glmerControl(optimizer="nloptwrap", calc.derivs = FALSE))
 
-save(mod_booked,file="mod_booked.Rda")
+save(mod_booked,file=paste(opt$output, "mod_booked.Rda", sep=''))
 
 #model buy cost given successful booking
 mod_cogs <- 
@@ -42,4 +47,4 @@ mod_cogs <-
                  , control=lmerControl(optimizer="nloptwrap", calc.derivs = FALSE)
      , weights = Wt)
 
-save(mod_cogs,file="mod_cogs.Rda")
+save(mod_cogs,file=paste(opt$output, "mod_cogs.Rda", sep=''))
