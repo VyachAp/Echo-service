@@ -1,16 +1,13 @@
 from datetime import datetime
-import aiodocker
 import aioftp
 import os
 from aiohttp import web
-from gcloud import storage
 from pathlib import Path
 import asyncio
 import aiojobs
 from aiojobs.aiohttp import setup, spawn
 from multidict import MultiDict
 import logging
-from aiofile import AIOFile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -20,7 +17,8 @@ ftp_password = "12345"
 folder = Path().absolute()
 state = {
     'status': 'IDLE',
-    'error': None
+    'error': None,
+    'image_tag' : None
     }
 
 routes = web.RouteTableDef()
@@ -90,6 +88,7 @@ async def build_image():
     state['status'] = "Image building"
     error = None
     tag = datetime.now().strftime("%Y%m%d%H%M")
+    state['image_tag'] = tag
     image = await asyncio.create_subprocess_shell(f'docker build -t us.gcr.io/synapse-157713/r-demo-project:{tag} {pwd}/r-driveproject')
     stdout, stderr = await image.communicate()
 
@@ -101,22 +100,20 @@ async def build_image():
     return error
 
 
-async def upload_csv(request):
-    storage_client = storage.Client()
-    bucket = storage_client.get_bucket("ad_documents")
-    blob = bucket.blob('/chosen-path-to-object/{name-of-object}')
-    blob.upload_from_filename('D:/Download/02-06-53.pdf')
-
-
-async def upload_model(request):
-    storage_client = storage.Client()
-    bucket = storage_client.get_bucket("ad_documents")
-    blob = bucket.blob('/chosen-path-to-object/{name-of-object}')
-    blob.upload_from_filename('D:/Download/02-06-53.pdf')
-
-
 async def upload_image():
-    pass
+    global state
+    state['status'] = "Pushing image to Google Cloud Registry"
+    error = None
+    tag = state['image_tag']
+    image_push = await asyncio.create_subprocess_shell(f'gcloud docker -- push us.gcr.io/synapse-157713/r-demo-project:{tag}')
+    stdout, stderr = await image_push.communicate()
+
+    if image_push.returncode != 0:
+        state['status'] = 'FAILED'
+        state['error'] = stderr.decode()
+        error = stderr.decode()
+
+    return error
 
 
 async def start():
@@ -126,6 +123,7 @@ async def start():
         # download_csv,
         # model_training,
         build_image,
+        upload_image
     ]
     for func in pipeline:
         if await func() is not None:
@@ -134,7 +132,6 @@ async def start():
     state['status'] = 'IDLE'
     # upload_csv()
     # upload_model()
-    # upload_image()
 
 
 async def file_upload_handler(request):
